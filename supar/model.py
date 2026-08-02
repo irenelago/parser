@@ -43,6 +43,10 @@ class Model(nn.Module):
                  **kwargs):
         super().__init__()
 
+        # Asegurar que feat sea una lista (no None)
+        if feat is None:
+            feat = []
+        
         self.args = Config().update(locals())
 
         if encoder == 'lstm':

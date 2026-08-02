@@ -31,6 +31,9 @@ from supar.utils.parallel import DistributedDataParallel as DDP
 from supar.utils.parallel import gather, is_dist, is_master, reduce
 from supar.utils.transform import Batch
 
+import pandas as pd
+from supar.utils.training_dynamics import log_training_dynamics
+
 logger = get_logger(__name__)
 
 
@@ -141,6 +144,15 @@ class Parser(object):
         if args.cache:
             args.bin = os.path.join(os.path.dirname(args.path), 'bin')
         args.even = args.get('even', is_dist())
+        
+        # Crear directorio del modelo si no existe
+        os.makedirs(os.path.dirname(args.path) or './', exist_ok=True)
+        
+        # Habilitar guardado de CSV de GUIDs para training dynamics
+        args.save_guid_csv = True
+        # Ruta de training dynamics dentro del directorio del modelo
+        args.td_path = os.path.join(os.path.dirname(args.path) or './', 'training_dynamics')
+        
         train = Dataset(self.transform, args.train, **args).build(
             batch_size=batch_size,
             n_buckets=buckets,
@@ -214,6 +226,11 @@ class Parser(object):
         for epoch in range(self.epoch, args.epochs + 1):
             start = datetime.now()
             bar, metric = progress_bar(loader), Metric()
+            
+            # Acumuladores para training dynamics
+            epoch_train_ids = []
+            epoch_train_logits = []
+            epoch_train_golds = []
 
             logger.info(f"Epoch {epoch} / {args.epochs}:")
             self.model.train()
@@ -223,7 +240,12 @@ class Parser(object):
                 for batch in bar:
                     with self.sync():
                         with torch.autocast(self.device, enabled=args.amp):
-                            loss = self.train_step(batch)
+                            loss, dynamics_data = self.train_step(batch, collect_dynamics=True)
+                            # Acumular datos de training dynamics
+                            for item in dynamics_data:
+                                epoch_train_ids.append(item['guid'])
+                                epoch_train_logits.append(item['logits'])
+                                epoch_train_golds.append(item['gold'])
                         self.backward(loss)
                     if self.sync_grad:
                         self.clip_grad_norm_(self.model.parameters(), args.clip)
@@ -237,12 +259,40 @@ class Parser(object):
                         wandb.log({'lr': self.scheduler.get_last_lr()[0], 'loss': loss})
                     self.step += 1
                 logger.info(f"{bar.postfix}")
+            
+            # Guardar training dynamics al final de cada epoch
+            if is_master():
+                log_training_dynamics(
+                    output_dir=args.td_path,
+                    epoch=epoch - 1,  # epochs 0-indexed
+                    train_ids=epoch_train_ids,
+                    train_logits=epoch_train_logits,
+                    train_golds=epoch_train_golds
+                )
+            
             self.model.eval()
             with self.join(), torch.autocast(self.device, enabled=args.amp):
                 metric = self.reduce(sum([self.eval_step(i) for i in progress_bar(dev.loader)], Metric()))
                 logger.info(f"{'dev:':5} {metric}")
                 if args.wandb and is_master():
                     wandb.log({'dev': metric.values, 'epochs': epoch})
+                
+                # Guardar métricas de validación en CSV
+                if is_master():
+                    val_metrics_path = os.path.join(os.path.dirname(args.path) or './', "val_metrics.csv")
+                    new_entry = pd.DataFrame({
+                        "epoch": [epoch - 1],  # 0-indexed como training dynamics
+                        "val_uas": [metric.uas],
+                        "val_las": [metric.las],
+                        "val_loss": [metric.loss]
+                    })
+                    if os.path.exists(val_metrics_path) and epoch > 1:
+                        val_df = pd.read_csv(val_metrics_path)
+                        val_df = pd.concat([val_df, new_entry], ignore_index=True)
+                    else:
+                        val_df = new_entry
+                    val_df.to_csv(val_metrics_path, index=False)
+                
                 if args.test:
                     test_metric = self.reduce(sum([self.eval_step(i) for i in progress_bar(test.loader)], Metric()))
                     logger.info(f"{'test:':5} {test_metric}")
@@ -277,7 +327,16 @@ class Parser(object):
             best.model.eval()
             with best.join():
                 test_metric = sum([best.eval_step(i) for i in progress_bar(test.loader)], Metric())
-                logger.info(f"{'test:':5} {best.reduce(test_metric)}")
+                test_metric = best.reduce(test_metric)
+                logger.info(f"{'test:':5} {test_metric}")
+                # Save test results to file
+                if is_master():
+                    results_path = os.path.join(os.path.dirname(args.path), 'log.txt')
+                    with open(results_path, 'w') as f:
+                        f.write(f"Best epoch: {self.best_e}\n")
+                        f.write(f"Dev: {self.best_metric}\n")
+                        f.write(f"Test: {test_metric}\n")
+                    logger.info(f"Results saved to {results_path}")
         logger.info(f"{self.elapsed}s elapsed, {self.elapsed / epoch}s/epoch")
         if args.wandb and is_master():
             wandb.finish()
@@ -346,6 +405,15 @@ class Parser(object):
         logger.info(f"{elapsed}s elapsed, "
                     f"{sum(data.sizes)/elapsed.total_seconds():.2f} Tokens/s, "
                     f"{len(data)/elapsed.total_seconds():.2f} Sents/s")
+
+        # Save results to file
+        if hasattr(args, 'path') and args.path:
+            results_dir = os.path.dirname(args.path)
+            suffix = os.path.basename(os.path.dirname(args.data)) if isinstance(args.data, str) else 'data'
+            results_file = os.path.join(results_dir, f'resultados_{suffix}.txt')
+            with open(results_file, 'w') as f:
+                f.write(f"{metric}\n")
+            logger.info(f"Results saved to {results_file}")
 
         return metric
 
@@ -562,7 +630,7 @@ class Parser(object):
         args = Config(**locals())
         if not os.path.exists(path):
             path = download(supar.MODEL[src].get(path, path), reload=reload)
-        state = torch.load(path, map_location='cpu')
+        state = torch.load(path, map_location='cpu', weights_only=False)
         cls = supar.PARSER[state['name']] if cls.NAME is None else cls
         args = state['args'].update(args)
         model = cls.MODEL(**args)

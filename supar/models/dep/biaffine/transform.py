@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import csv
 from io import StringIO
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence, Tuple, Union
 
@@ -46,6 +47,8 @@ class CoNLL(Transform):
             Projective heads of tokens, which are either values of ID or zeros, or underscores if not available.
         PDEPREL:
             Dependency relations to the PHEAD, or underscores if not available.
+        GUID:
+            Unique identifier for each token for training dynamics.
     """
 
     fields = ['ID', 'FORM', 'LEMMA', 'CPOS', 'POS', 'FEATS', 'HEAD', 'DEPREL', 'PHEAD', 'PDEPREL']
@@ -75,6 +78,9 @@ class CoNLL(Transform):
         self.DEPREL = DEPREL
         self.PHEAD = PHEAD
         self.PDEPREL = PDEPREL
+        
+        # Contador de GUIDs para training dynamics (se reinicia en load() si es necesario)
+        self._guid_counter = 0
 
     @property
     def src(self):
@@ -372,6 +378,7 @@ class CoNLL(Transform):
         lang: Optional[str] = None,
         proj: bool = False,
         malt: str = None,
+        save_guid_csv: bool = False,
         **kwargs
     ) -> Iterable[CoNLLSentence]:
         r"""
@@ -391,10 +398,17 @@ class CoNLL(Transform):
             malt (bool):
                 If specified, projectivizes all the non-projective trees to pseudo-projective ones.
                 Default: ``None``.
+            save_guid_csv (bool):
+                If ``True``, saves the guid_sentence.csv file to the dataset directory.
+                Default: ``False``.
 
         Returns:
             A list of :class:`CoNLLSentence` instances.
         """
+        # Reiniciar contador de GUIDs si se va a guardar el CSV de training
+        if save_guid_csv and self.training:
+            self._guid_counter = 0
+            guid_sentence_records = []
 
         isconll = False
         if lang is not None:
@@ -422,7 +436,17 @@ class CoNLL(Transform):
             for line in lines:
                 line = line.strip()
                 if len(line) == 0:
-                    sentence = CoNLLSentence(self, sentence, index)
+                    # Asignar GUIDs a los tokens (sin contar ROOT que se añade como bos)
+                    n_tokens = len([l for l in sentence if l.split('\t')[0].isdigit()])
+                    token_guids = list(range(self._guid_counter, self._guid_counter + n_tokens))
+                    self._guid_counter += n_tokens
+                    
+                    # Guardar mapeo guid-oración para datos de entrenamiento
+                    if save_guid_csv and self.training:
+                        for guid in token_guids:
+                            guid_sentence_records.append({'sentence': index, 'guid': guid})
+                    
+                    sentence = CoNLLSentence(self, sentence, index, token_guids)
                     if isconll and self.training and proj and not sentence.projective:
                         logger.warning(f"Sentence {index} is not projective. Discarding it!")
                     else:
@@ -431,6 +455,17 @@ class CoNLL(Transform):
                     sentence = []
                 else:
                     sentence.append(line)
+        
+        # Guardar guid_sentence.csv SOLO para el conjunto de entrenamiento
+        if save_guid_csv and self.training and isinstance(data, str) and os.path.exists(data):
+            # Verificar que sea el archivo de train
+            if 'train' in os.path.basename(data).lower():
+                csv_path = os.path.join(os.path.dirname(data), 'guid_sentence.csv')
+                with open(csv_path, 'w', newline='') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=['sentence', 'guid'])
+                    writer.writeheader()
+                    writer.writerows(guid_sentence_records)
+                logger.info(f"Guardado mapeo GUID-oración ({len(set(r['sentence'] for r in guid_sentence_records))} oraciones, {len(guid_sentence_records)} tokens) en {csv_path}")
 
 
 class CoNLLSentence(Sentence):
@@ -482,7 +517,7 @@ class CoNLLSentence(Sentence):
         12      .       _       _       _       _       3       punct   _       _
     """
 
-    def __init__(self, transform: CoNLL, lines: Sequence[str], index: Optional[int] = None) -> CoNLLSentence:
+    def __init__(self, transform: CoNLL, lines: Sequence[str], index: Optional[int] = None, token_guids: Optional[Sequence[int]] = None) -> CoNLLSentence:
         super().__init__(transform, index)
 
         self.values = []
@@ -497,6 +532,11 @@ class CoNLLSentence(Sentence):
                 self.annotations[len(self.values)] = line
                 self.values.append(value)
         self.values = list(zip(*self.values))
+        
+        # Guardar GUIDs de tokens (uno por token, sin incluir ROOT que se añade como bos)
+        # NO añadir a self.values porque puede causar inconsistencias en las longitudes
+        # y errores CUDA. Se accede directamente via self.token_guids en train_step.
+        self.token_guids = token_guids if token_guids is not None else []
 
     def __repr__(self):
         return self.conll_format()

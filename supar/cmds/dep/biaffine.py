@@ -15,7 +15,7 @@ def main():
     subparsers = parser.add_subparsers(title='Commands', dest='mode')
     # train
     subparser = subparsers.add_parser('train', help='Train a parser.')
-    subparser.add_argument('--feat', '-f', choices=['tag', 'char', 'elmo', 'bert'], nargs='*', help='features to use')
+    subparser.add_argument('--feat', '-f', choices=['tag', 'char', 'elmo', 'bert'], nargs='*', default=[], help='features to use (optional)')
     subparser.add_argument('--build', '-b', action='store_true', help='whether to build the model first')
     subparser.add_argument('--checkpoint', action='store_true', help='whether to load a checkpoint to restore training')
     subparser.add_argument('--encoder', choices=['lstm', 'transformer', 'bert'], default='lstm', help='encoder to use')
@@ -27,6 +27,11 @@ def main():
     subparser.add_argument('--test', default='data/ptb/test.conllx', help='path to test file')
     subparser.add_argument('--embed', default='glove-6b-100', help='file or embeddings available at `supar.utils.Embedding`')
     subparser.add_argument('--bert', default='bert-base-cased', help='which BERT model to use')
+    # training hyperparameters
+    subparser.add_argument('--epochs', default=1000, type=int, help='number of training epochs')
+    subparser.add_argument('--patience', default=100, type=int, help='patience for early stopping')
+    subparser.add_argument('--batch-size', default=5000, type=int, help='number of tokens in each batch')
+
     # evaluate
     subparser = subparsers.add_parser('evaluate', help='Evaluate the specified parser and dataset.')
     subparser.add_argument('--punct', action='store_true', help='whether to include punctuation')

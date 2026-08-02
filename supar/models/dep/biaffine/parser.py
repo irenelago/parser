@@ -91,14 +91,58 @@ class BiaffineDependencyParser(Parser):
     ):
         return super().predict(**Config().update(locals()))
 
-    def train_step(self, batch: Batch) -> torch.Tensor:
+    def train_step(self, batch: Batch, collect_dynamics: bool = False) -> torch.Tensor:
         words, _, *feats, arcs, rels = batch
         mask = batch.mask
         # ignore the first token of each sentence
         mask[:, 0] = 0
         s_arc, s_rel = self.model(words, feats)
         loss = self.model.loss(s_arc, s_rel, arcs, rels, mask, self.args.partial)
-        return loss
+        
+        if not collect_dynamics:
+            return loss
+        
+        # Recopilar datos de training dynamics
+        # s_arc: [batch_size, seq_len, seq_len] - scores de arcos (padres)
+        # s_rel: [batch_size, seq_len, seq_len, n_rels] - scores de relaciones
+        dynamics_data = []
+        
+        for i, sentence in enumerate(batch.sentences):
+            # Obtener los GUIDs de esta oración (sin incluir ROOT en posición 0)
+            token_guids = sentence.token_guids
+            # Contar tokens válidos DESPUÉS de mask[:, 0] = 0
+            # mask[i] tiene 1s en posiciones válidas (excluyendo ROOT que ya está en 0)
+            valid_positions = mask[i].nonzero(as_tuple=False).squeeze(-1)  # posiciones válidas
+            
+            # Para cada token válido (saltando posición 0 que es ROOT)
+            for idx, j in enumerate(valid_positions.tolist()):
+                if idx < len(token_guids):  # verificar que tenemos guid
+                    guid = token_guids[idx]
+                    
+                    # Logits de arco para este token: scores de todos los posibles padres
+                    # s_arc[i, j, :] da los scores de que cada posición sea el padre del token j
+                    # Solo necesitamos los logits de las posiciones válidas (incluyendo ROOT en pos 0)
+                    # max_pos = valid_positions.max().item() + 1 if len(valid_positions) > 0 else j + 1
+                    max_pos = valid_positions.max().item() + 1
+                    
+                    arc_logits = s_arc[i, j, :max_pos].detach().cpu().tolist()
+
+                    # Valores gold
+                    gold_arc = arcs[i, j].item()
+                    gold_rel = rels[i, j].item()
+                    
+                    # Logits de relación: para el padre predicho, obtener los scores de relaciones
+                    # pred_head = arc_preds[i, j].item()
+                    rel_logits = s_rel[i, j, gold_arc, :].detach().cpu().tolist()
+                    
+                    
+                    dynamics_data.append({
+                        'guid': guid,
+                        'logits': [arc_logits, rel_logits],  # [vector_logits_arco, vector_logits_relación]
+                        'gold': [gold_arc, gold_rel]  # [padre_gold, relación_gold]
+                    })
+        
+        return loss, dynamics_data
 
     @torch.no_grad()
     def eval_step(self, batch: Batch) -> AttachmentMetric:
